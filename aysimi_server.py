@@ -1,0 +1,737 @@
+#!/usr/bin/env python
+# -*- coding:utf-8 -*-
+import ConfigParser
+import json
+import multiprocessing
+import urllib
+
+import tornado.ioloop
+import tornado.web
+import os
+import jieba
+import sys
+import re
+import node
+import time
+import urllib2
+import logging
+import logging.handlers
+
+if sys.getdefaultencoding() is not 'utf-8':
+    reload(sys)
+    sys.setdefaultencoding('utf-8')
+
+work_dir = ''  # similar anyou server work dir
+server_port = ''  # similar anyou server port
+similog = None  # similar anyou server log
+mp_server_url = list()  # java mp server ip
+class_server_url = 'http://172.16.124.12:8398/anyouClassify'
+minshi_firstlist = list()  # minshi json data
+minshi_nodemap = dict()
+minshi_label_map = dict()
+xingshi_firstlist = list()  # xingshi json data
+xingshi_nodemap = dict()
+xingshi_label_map = dict()
+
+
+class FinalLogger:
+    logger = None
+
+    levels = {'n': logging.NOTSET,
+              'd': logging.DEBUG,
+              'i': logging.INFO,
+              'w': logging.WARN,
+              'e': logging.ERROR,
+              'c': logging.CRITICAL}
+
+    log_level = 'd'
+    log_file = 'anyou_classify_logger.log'
+    log_max_byte = 10 * 1024 * 1024
+    log_backup_count = 5
+
+    @staticmethod
+    def getLogger():
+        if FinalLogger.logger is not None:
+            return FinalLogger.logger
+
+        FinalLogger.logger = logging.Logger('oggingmodule.FinalLogger')
+        log_handler = logging.handlers.RotatingFileHandler(filename=FinalLogger.log_file, \
+                                                           maxBytes=FinalLogger.log_max_byte, \
+                                                           backupCount=FinalLogger.log_backup_count)
+        log_fmt = logging.Formatter('%(asctime)s %(levelname)s %(filename)s[line:%(lineno)d] %(message)s')
+        log_handler.setFormatter(log_fmt)
+        FinalLogger.logger.addHandler(log_handler)
+        FinalLogger.logger.setLevel(FinalLogger.levels.get(FinalLogger.log_level))
+        return FinalLogger.logger
+
+
+def run_mp_server(server_url, server_param):
+    data_simi_param = urllib.urlencode(server_param)
+    req = urllib2.Request(server_url, data=data_simi_param)
+    response = urllib2.urlopen(req)
+    selected_docs = response.read()
+    selected_docs = str(selected_docs).split(';')
+    return selected_docs
+
+
+def parse_target(res_target, dict_target_DMs):
+    if not res_target:
+        return
+
+    if 'sons' in res_target.keys():
+        children = res_target['sons']
+        if len(children) > 0:
+            for child in children:
+                parse_target(child, dict_target_DMs)
+
+    dict_target_DMs[res_target['DM']] = float(res_target['prob'])
+
+
+def get_simi_docs_demo(src, doc_hit, anyou_type, anyou_type_assign, anyou_id, if_classify):
+    print 'request params', src, doc_hit, anyou_type, anyou_type_assign, anyou_id, if_classify
+    start_time = time.time()
+    model_basedir = work_dir + 'anyou/'
+    if ['assign'] == if_classify and anyou_id:
+        targetDMs = re.compile(r'\d+').findall(anyou_id)
+        print 'targetDMs Assign: ', targetDMs
+        anyou_type = anyou_type_assign
+    else:
+        req_dict = dict()
+        req_dict['src'] = src
+        if anyou_type == 'minshi':
+            req_dict['anyou_type'] = 'minshi'
+        elif anyou_type == 'xingshi':
+            req_dict['anyou_type'] = 'xingshi'
+        req_encode = urllib.urlencode(req_dict)
+        req_post = req_encode.encode('utf-8')
+        req = urllib2.Request(url=class_server_url, data=req_post)
+        res = urllib2.urlopen(req)
+        res = res.read().decode('utf-8')
+        res = json.loads(res)
+
+        dict_target_DMs = dict()
+        if anyou_type == 'minshi':
+            if res['minshi'] and res['minshi']['labels'] and res['minshi']['labels']['status'] \
+                    and res['minshi']['labels']['status'] == 'ok':
+                for res_dict in res['minshi']['labels']['labels']:
+                    parse_target(res_dict, dict_target_DMs)
+        elif anyou_type == 'xingshi':
+            if res['xingshi'] and res['xingshi']['labels'] and res['xingshi']['labels']['status'] \
+                    and res['xingshi']['labels']['status'] == 'ok':
+                for res_dict in res['xingshi']['labels']['labels']:
+                    parse_target(res_dict, dict_target_DMs)
+        else:
+            if 'minshi' in res.keys() and 'labels' in res['minshi'].keys() and 'prob' in res['minshi'].keys() \
+                    and res['minshi']['labels']['status'] and res['minshi']['labels']['status'] == 'ok':
+                anyou_type = 'minshi'
+                for res_dict in res['minshi']['labels']['labels']:
+                    parse_target(res_dict, dict_target_DMs)
+            elif 'xingshi' in res.keys() and 'labels' in res['xingshi'].keys() and 'prob' in res['xingshi'].keys() \
+                    and res['xingshi']['labels']['status'] and res['xingshi']['labels']['status'] == 'ok':
+                anyou_type = 'xingshi'
+                for res_dict in res['xingshi']['labels']['labels']:
+                    parse_target(res_dict, dict_target_DMs)
+
+        targetDMs = dict_target_DMs.keys()
+        sort_target_prob = sorted(dict_target_DMs.items(), key=lambda k: k[1], reverse=True)
+        avg_prob = sum(dict_target_DMs.values()) / len(dict_target_DMs)
+        sim_prob = 0.5
+        sim_prob = min(sim_prob, avg_prob)
+        sim_target_num = 4
+        sim_target_num = max(len(targetDMs) / 2, sim_target_num)
+        sim_target = []
+
+        for target_one in sort_target_prob:
+            if len(sim_target) >= sim_target_num:
+                break
+            if target_one[1] >= sim_prob:
+                sim_target.append(target_one[0])
+
+        targetDMs = sim_target
+        # print 'targetDMs Class: ', targetDMs
+
+        if 'assign' in if_classify:
+            para_anyou_id = re.compile(r'\d+').findall(anyou_id)
+            for data_id in para_anyou_id:
+                if data_id not in targetDMs:
+                    targetDMs.append(data_id)
+
+    print 'targetDMs Final:', targetDMs
+
+    """
+    similar-text matrix vector
+    """
+    result_doc_list = []
+
+    # mp_server
+    dict_mp_server = dict()
+    for i_server_url in mp_server_url:
+        dict_mp_server[i_server_url] = list()
+
+    mp_url_len = len(mp_server_url)
+    for i in range(len(targetDMs)):
+        dict_mp_server[mp_server_url[i % mp_url_len]].append(targetDMs[i])
+
+    pool = multiprocessing.Pool(processes=len(mp_server_url))
+    res_docs = list()
+
+    for k, v in dict_mp_server.items():
+        if v:
+            simi_param = dict()
+            simi_param['simisrc'] = str(src)
+            simi_param['anyoutype'] = anyou_type
+            simi_param['minsentlen'] = 6
+            simi_param['maxsentlen'] = 12
+            simi_param['anyouids'] = ','.join(v)
+            res_docs.append(pool.apply_async(run_mp_server, (k, simi_param)))
+    pool.close()
+    pool.join()
+    selected_docs = list()
+    for res in res_docs:
+        selected_docs.extend(res.get())
+
+    selected_docs = [res_doc.split('\t') for res_doc in selected_docs if len(res_doc.split('\t')) == 4]
+    selected_docs.sort(key=lambda s: s[2], reverse=True)
+    selected_docs = selected_docs[0:10]
+
+    for doc_val in selected_docs:
+        if len(doc_val) < 2:
+            continue
+        newDoc = {}
+        newDoc['DM'] = doc_val[0]
+        newDoc['id'] = doc_val[1]
+        if anyou_type == 'xingshi':
+            newDoc['案由'] = xingshi_nodemap[doc_val[0]].get('MC')
+        elif anyou_type == 'minshi':
+            newDoc['案由'] = minshi_nodemap[doc_val[0]].get('MC')
+        newDoc['相似度'] = doc_val[2]
+
+        list_row_col = []
+        target_list = [x for x in re.compile(r',').split(doc_val[3][1:len(doc_val[3]) - 1])]
+        for i in range(len(target_list)):
+            one_row_col = [x for x in re.compile(r' ').split(target_list[i])]
+            if i == 0:
+                list_row_col.append((int(one_row_col[0]), int(one_row_col[1])))
+            else:
+                list_row_col.append((int(one_row_col[1]), int(one_row_col[2])))
+
+        newDoc['DATASYM'] = list_row_col
+
+        result_doc_list.append(newDoc)
+
+    for i in range(len(result_doc_list)):
+        print result_doc_list[i]['DM'], '---', result_doc_list[i]['id'], result_doc_list[i]['相似度']
+
+    docloc = {}
+    loc = 0
+    docset = set()
+    for doc in result_doc_list:
+        docloc[doc['DM'] + '-' + str(doc['id'])] = loc
+        loc += 1
+        docset.add(doc['DM'])
+    for targetDM in targetDMs:
+        if targetDM not in docset:
+            continue
+        num = 0
+        srcfile = model_basedir + anyou_type + '/src/' + targetDM + '.txt'
+        fp = open(srcfile)
+        line = fp.readline()
+        gotten = 0
+        while line:
+            doc_index = targetDM + '-' + str(num)
+            if doc_index in docloc.keys():
+                result_doc_list[docloc[doc_index]]['src'] = line
+                gotten += 1
+                if gotten >= len(result_doc_list):
+                    break
+            num = num + 1
+            line = fp.readline()
+    print 'Elapse time ' + str((time.time() - start_time))
+    return result_doc_list
+
+
+def get_simi_docs(src, doc_hit, anyou_type):
+    print 'request params', src, doc_hit, anyou_type
+    start_time = time.time()
+    model_basedir = work_dir + 'anyou/'
+    req_dict = dict()
+    req_dict['src'] = src
+    if anyou_type == 'minshi':
+        req_dict['anyou_type'] = 'minshi'
+    elif anyou_type == 'xingshi':
+        req_dict['anyou_type'] = 'xingshi'
+    req_encode = urllib.urlencode(req_dict)
+    req_post = req_encode.encode('utf-8')
+    req = urllib2.Request(url=class_server_url, data=req_post)
+    res = urllib2.urlopen(req)
+    res = res.read().decode('utf-8')
+    res = json.loads(res)
+
+    dict_target_DMs = dict()
+    if anyou_type == 'minshi':
+        if res['minshi'] and res['minshi']['labels'] and res['minshi']['labels']['status'] \
+                and res['minshi']['labels']['status'] == 'ok':
+            for res_dict in res['minshi']['labels']['labels']:
+                parse_target(res_dict, dict_target_DMs)
+    elif anyou_type == 'xingshi':
+        if res['xingshi'] and res['xingshi']['labels'] and res['xingshi']['labels']['status'] \
+                and res['xingshi']['labels']['status'] == 'ok':
+            for res_dict in res['xingshi']['labels']['labels']:
+                parse_target(res_dict, dict_target_DMs)
+    else:
+        # Todo: anyou_type: anyou_id to compute simi-anyous
+        if 'minshi' in res.keys() and 'labels' in res['minshi'].keys() and 'prob' in res['minshi'].keys() \
+                and res['minshi']['labels']['status'] and res['minshi']['labels']['status'] == 'ok':
+            anyou_type = 'minshi'
+            for res_dict in res['minshi']['labels']['labels']:
+                parse_target(res_dict, dict_target_DMs)
+        elif 'xingshi' in res.keys() and 'labels' in res['xingshi'].keys() and 'prob' in res['xingshi'].keys() \
+                and res['xingshi']['labels']['status'] and res['xingshi']['labels']['status'] == 'ok':
+            anyou_type = 'xingshi'
+            for res_dict in res['xingshi']['labels']['labels']:
+                parse_target(res_dict, dict_target_DMs)
+
+    targetDMs = dict_target_DMs.keys()
+    sort_target_prob = sorted(dict_target_DMs.items(), key=lambda k: k[1], reverse=True)
+    avg_prob = sum(dict_target_DMs.values()) / len(dict_target_DMs)
+    sim_prob = 0.5
+    sim_prob = min(sim_prob, avg_prob)
+    sim_target_num = 4
+    sim_target_num = max(len(targetDMs) / 2, sim_target_num)
+    sim_target = []
+
+    for target_one in sort_target_prob:
+        if len(sim_target) >= sim_target_num:
+            break
+        if target_one[1] >= sim_prob:
+            sim_target.append(target_one[0])
+
+    targetDMs = sim_target
+    print 'targetDMs Class: ', targetDMs
+
+    """
+    similar-text matrix vector
+    """
+    result_doc_list = []
+
+    # mp_server
+    dict_mp_server = dict()
+    for i_server_url in mp_server_url:
+        dict_mp_server[i_server_url] = list()
+
+    mp_url_len = len(mp_server_url)
+    for i in range(len(targetDMs)):
+        dict_mp_server[mp_server_url[i % mp_url_len]].append(targetDMs[i])
+
+    pool = multiprocessing.Pool(processes=len(mp_server_url))
+    res_docs = list()
+
+    for k, v in dict_mp_server.items():
+        if v:
+            simi_param = dict()
+            simi_param['simisrc'] = str(src)
+            simi_param['anyoutype'] = anyou_type
+            simi_param['minsentlen'] = 6
+            simi_param['maxsentlen'] = 12
+            simi_param['anyouids'] = ','.join(v)
+            res_docs.append(pool.apply_async(run_mp_server, (k, simi_param)))
+    pool.close()
+    pool.join()
+    selected_docs = list()
+    for res in res_docs:
+        selected_docs.extend(res.get())
+
+    selected_docs = [res_doc.split('\t') for res_doc in selected_docs if len(res_doc.split('\t')) == 4]
+    selected_docs.sort(key=lambda s: s[2], reverse=True)
+    selected_docs = selected_docs[0:10]
+
+    for doc_val in selected_docs:
+        if len(doc_val) < 2:
+            continue
+        newDoc = {}
+        newDoc['DM'] = doc_val[0]
+        newDoc['id'] = doc_val[1]
+        if anyou_type == 'xingshi':
+            newDoc['案由'] = xingshi_nodemap[doc_val[0]].get('MC')
+        elif anyou_type == 'minshi':
+            newDoc['案由'] = minshi_nodemap[doc_val[0]].get('MC')
+        newDoc['相似度'] = doc_val[2]
+        result_doc_list.append(newDoc)
+
+    for i in range(len(result_doc_list)):
+        print result_doc_list[i]['DM'], '---', result_doc_list[i]['id'], result_doc_list[i]['相似度']
+
+    docloc = {}
+    loc = 0
+    docset = set()
+    for doc in result_doc_list:
+        docloc[doc['DM'] + '-' + str(doc['id'])] = loc
+        loc += 1
+        docset.add(doc['DM'])
+    for targetDM in targetDMs:
+        if targetDM not in docset:
+            continue
+        num = 0
+        srcfile = model_basedir + anyou_type + '/src/' + targetDM + '.txt'
+        fp = open(srcfile)
+        line = fp.readline()
+        gotten = 0
+        while line:
+            doc_index = targetDM + '-' + str(num)
+            if doc_index in docloc.keys():
+                result_doc_list[docloc[doc_index]]['src'] = line
+                gotten += 1
+                if gotten >= len(result_doc_list):
+                    break
+            num = num + 1
+            line = fp.readline()
+    print 'Elapse time ' + str((time.time() - start_time))
+    return result_doc_list
+
+
+class MainHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.write(
+            "<html><head><title>案件分析调用接口</title></head><body>案件分析调用接口  &nbsp;&nbsp;&nbsp;<a href=/similarCaseDemo>api调用demo</a>　 &nbsp;&nbsp;&nbsp;")
+        # self.write("<br><br>方法1：   anyouClassify ")
+        # self.write("<br>功能：   完成对案由的分类 ")
+        # self.write("<br>调用方法：http请求   请求URL：  http://$host:$port/anyouClassify")
+        # self.write("<br>请求类型：post    ")
+        # self.write("<br>请求参数：序列化后的json对象，包括２个字段，必选字段：src(原文)，可选字段：anyou_type(案由类型:minshi或者xingshi)")
+        # self.write("<br>编码支持：utf-8 ")
+        # self.write("<br>返回结果：Json对象序列化后的字符串 ")
+        # self.write("<br>")
+
+        self.write("<br>方法：   similarCase ")
+        self.write("<br>功能：   根据一段文本匹配相似案例 ")
+        self.write("<br>调用方法：http请求   请求URL：  http://$host:$port/similarCase")
+        self.write("<br>请求类型：post    ")
+        self.write("<br>请求参数：序列化后的json对象，包括２个字段，必选字段：src(原文)，可选字段：anyou_type(案由类型:minshi或者xingshi)")
+        self.write("<br>编码支持：utf-8 ")
+        self.write("<br>返回结果：Json对象序列化后的字符串")
+        self.write("<br>")
+
+        # self.write("<br>方法３： zhengju ")
+        # self.write("<br>功能：   完成对证据名称的分类 ")
+        # self.write("<br>调用方法：http请求   请求URL：  http://$host:$port/zhengjuClassify")
+        # self.write("<br>请求类型：post    ")
+        # self.write("<br>请求参数：序列化后的json对象　包括１个字段：src(原文) ")
+        # self.write("<br>编码支持：utf-8 ")
+        # self.write("<br>返回结果：Json对象序列化后的字符串 ")
+        # self.write("</body></html>")
+
+
+class SimilarCaseDemoHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.write('<html><body><form action="/similarCaseDemo" method="post">'
+                   '<p><b>相似案例查找demo</b></p>'
+                   '<p>案件基本情况</p>'
+                   '<textarea name="message" style="width:600px;height:300px;">'
+                   """经审理查明，被告人夏伯红于2014年5月12日与罗某在电话中达成毒品交易意向。同日13时50分许，夏伯红在本市渝中区西三街建设银行门口附近，将净重为0．7克的毒品冰毒贩卖给罗某，获取毒资350元，交易完成后被公安机关捉获，查获上述毒品毒资。经鉴定，上述冰毒中检测出甲基苯丙胺成分。上述事实，被告人夏伯红在开庭审理过程中亦无异议，并有物证毒品毒资照片，书证受案登记表、立案决定书、抓获经过、户籍信息、扣押决定书、扣押清单、本院（2012）中区刑初字第01818号刑事判决书、刑满释放证明书、侦查借款单、毒资情况说明、收缴毒品凭证、通话清单、鉴定委托书，证人罗某的证言，被告人夏伯红的供述，鉴定意见毒品检验报告，提取笔录、称量笔录等证据证实，足以认定。
+                   """
+                   '</textarea>'
+                   '<p>&nbsp;</p>'
+                   '<label><input name="if_classify" type="checkbox" value="identy" checked="checked"/>自动识别案由</label>'
+                   '&nbsp;&nbsp;&nbsp;'
+                   '<select name="anyou_type" style="width:100px;">'
+                   '<option value="">自动识别</option>'
+                   '<option value="minshi">民事</option>'
+                   '<option value="xingshi">刑事</option>'
+                   '</select>'
+                   '<p>&nbsp;</p>'
+                   '<label><input name="if_classify" type="checkbox" value="assign" />指定输入案由</label>'
+                   '&nbsp;&nbsp;&nbsp;'
+                   '<select name="correct_anyou_type" style="width:100px;">'
+                   '<option value="minshi">民事</option>'
+                   '<option value="xingshi">刑事</option>'
+                   '</select>'
+                   '&nbsp;&nbsp;&nbsp;'
+                   '<input type="text" name="classify_id" />'
+                   '(例: 9000，9001)'
+                   '<br>'
+                   '<a href=/anyou/xingshi_classify.json>刑事案由参考</a>&nbsp;&nbsp;&nbsp;'
+                   '<a href=/anyou/minshi_classify.json>民事案由参考</a> </p>'
+                   '<p>&nbsp;</p>'
+                   '界面显示'
+                   '&nbsp;&nbsp;&nbsp;'
+                   '<label><input name="view_similar" type="radio" value="simi_word" checked="checked"/>案例匹配</label>'
+                   '<label><input name="view_similar" type="radio" value="simi_line"/>短句匹配</label>'
+                   '<br><br> <input type="submit" value="Submit">'
+                   '</form>'
+                   '</body></html>')
+
+    def post(self):
+        self.set_header("Content-Type", "text/html")
+        src = self.get_argument("message")
+        if_classify = self.get_arguments("if_classify")
+        if_classify = [str(x) for x in if_classify]
+        view_similar = str(self.get_argument("view_similar"))
+        anyou_id = self.get_argument("classify_id")
+        anyou_type = self.get_argument("anyou_type")
+        anyou_type_assign = self.get_argument("correct_anyou_type")
+        similog.info(self.request.remote_ip + ', similar demo: ' + src)
+        data = {}
+        data["hits"] = 10
+        data["src"] = src
+        result = get_simi_docs_demo(data["src"], data["hits"], anyou_type, str(anyou_type_assign), str(anyou_id),
+                                    if_classify)
+        # result = get_simi_docs(data["src"], data["hits"], anyou_type)
+        stopword_set = set(["年", "月", "日", "的", "了", "将", "诉称"
+                               , "后", "于", "并", "但", "与", "元", "万元"
+                               , "”", "、", "《", "》", "：", "；", "，", "。"])
+        src_word_list = jieba.cut(src, cut_all=False)
+        src_word_set = set()
+        digits = re.compile(r"\d+")
+        for word in src_word_list:
+            digitmatch = re.match(digits, word)
+            if digitmatch != None:
+                continue
+            if word.encode() not in stopword_set:
+                src_word_set.add(word)
+
+        from matrixText.matrix_seg import seg_sentence
+        src_list = seg_sentence(str(src))
+
+        self.write('<!DOCTYPE html>'
+                   '<html><head>'
+                   '<meta http-equiv="content-type" content="text/html;charset=utf-8">'
+                   '<title>相似案例结果</title>')
+        self.write("</head>")
+        self.write("<body>")
+        self.write("<div>")
+
+        self.write('<table border = "1">'
+                   '<tr>'
+                   '<th style="width: 40%">' + '源文' + '</th>'
+                                                      '<th style="width: 60%">相似案例</th>'
+                                                      '</tr>'
+                   )
+
+        separation = '<br>'
+        i = 1
+        for res_one in result:
+            if "src" not in res_one.keys():
+                continue
+
+            if 'simi_line' == view_similar:
+
+                self.write('<tr>')
+                self.write('<td>')
+                self.write("<p>" + str(i) + ":&nbsp;&nbsp;&nbsp;&nbsp;")
+                self.write(separation)
+
+                res_test_sym = list()
+                res_norm_sym = list()
+                for j in range(len(res_one['DATASYM'])):
+                    res_test_sym.append(res_one['DATASYM'][j][0])
+                    res_norm_sym.append(res_one['DATASYM'][j][1])
+
+                for j in range(len(src_list)):
+                    if j in res_test_sym:
+                        if res_test_sym.index(j) == 0:
+                            self.write("<b><font color=\"red\">" + '[ ' + str(j) + ' - ' + str(res_norm_sym[0])
+                                       + ' ]' + '<sub>' + str(0) + '</sub>' + ': ' + src_list[j] + "</font></b>")
+                            self.write(separation)
+                        elif res_test_sym.index(j) in [1, 2, 3]:
+                            self.write("<b><font color=\"blue\">" + '[ ' + str(j) + ' - ' + str(
+                                res_norm_sym[res_test_sym.index(j)])
+                                       + ' ]' + '<sub>' + str(res_test_sym.index(j)) + '</sub>' + ': '
+                                       + src_list[j] + "</font></b>")
+                            self.write(separation)
+                        else:
+                            self.write("<b><font color=\"olive\">" + '[ ' + str(j) + ' - ' + str(
+                                res_norm_sym[res_test_sym.index(j)])
+                                       + ' ]' + '<sub>' + str(res_test_sym.index(j)) + '</sub>' + ': ' + "</font></b>")
+                            self.write(src_list[j])
+                            self.write(separation)
+                    elif src_list[j] and not re.compile(r'^\s*\n*$').match(src_list[j]):
+                        self.write('[' + str(j) + ']: ' + src_list[j])
+                        self.write(separation)
+                self.write('</td>')
+
+                self.write('<td>')
+                self.write("<p>" + str(i) + ":&nbsp;&nbsp;&nbsp;&nbsp;")
+                self.write(separation)
+                doc_list = seg_sentence(res_one["src"])
+
+                for j in range(len(doc_list)):
+                    if j in res_norm_sym:
+                        if res_norm_sym.index(j) == 0:
+                            self.write("<b><font color=\"red\">" + '[ ' + str(j) + ' - ' + str(res_test_sym[0])
+                                       + ' ]' + '<sub>' + str(0) + '</sub>' + ': ' + doc_list[j] + "</font></b>")
+                            self.write(separation)
+                        elif res_norm_sym.index(j) in [1, 2, 3]:
+                            self.write(
+                                "<b><font color=\"blue\">" + '[ ' + str(j) + ' - ' + str(
+                                    res_test_sym[res_norm_sym.index(j)])
+                                + ' ]' + '<sub>' + str(res_norm_sym.index(j)) + '</sub>' + ': '
+                                + doc_list[j] + "</font></b>")
+                            self.write(separation)
+                        else:
+                            self.write(
+                                "<b><font color=\"olive\">" + '[ ' + str(j) + ' - ' + str(
+                                    res_test_sym[res_norm_sym.index(j)])
+                                + ' ]' + '<sub>' + str(res_norm_sym.index(j)) + '</sub>' + ': ' + "</font></b>")
+                            self.write(doc_list[j])
+                            self.write(separation)
+                    elif doc_list[j] and not re.compile(r'^\s*\n*$').match(doc_list[j]):
+                        self.write('[' + str(j) + ']: ' + doc_list[j])
+                        self.write(separation)
+
+                self.write('</td>')
+                self.write('</tr>')
+
+            elif 'simi_word' == view_similar or view_similar == []:
+
+                self.write('<tr>')
+                self.write('<td>')
+                self.write("<p>" + str(i) + ":&nbsp;&nbsp;&nbsp;&nbsp;")
+                self.write(separation)
+
+                self.write(str(src))
+                self.write('</td>')
+
+                self.write('<td>')
+                self.write("<p>" + str(i) + ":&nbsp;&nbsp;&nbsp;&nbsp;")
+                self.write(separation)
+
+                target_word_list = jieba.cut(res_one["src"], cut_all=False)
+                sameCount = 0
+                sameWords = ""
+                for word in target_word_list:
+                    if word in src_word_set:
+                        sameWords += word
+                        sameCount += 1
+                    else:
+                        if sameCount >= 3:
+                            self.write("<b><font color=\"green\">" + sameWords + "</font></b>")
+                        else:
+                            self.write(sameWords)
+                        sameCount = 0
+                        sameWords = ""
+                        self.write(word)
+                if sameCount > 0:
+                    if sameCount >= 2:
+                        self.write("<b><font color=\"green\">" + sameWords + "</font></b>")
+                    else:
+                        self.write(sameWords)
+
+                self.write('</td>')
+                self.write('</tr>')
+
+            i += 1
+
+        self.write('</table>')
+        self.write("</div>")
+        self.write("</body></html>")
+
+
+class SimilarCaseHandler(tornado.web.RequestHandler):
+    def post(self):
+        start_time = time.time()
+        raw_data = self.request.body
+        anyou_hit = "3"
+        anyou_type  = ""
+        similog.info(self.request.remote_ip + " raw:" + raw_data)
+        res = self.request.arguments
+        src = res["src"][0]
+        if 'hits' in res.keys():
+            anyou_hit = res['hits'][0]
+        if 'anyou_type' in res.keys():
+            anyou_type = res['anyou_type'][0]
+
+        similog.info(self.request.remote_ip + " SimilarCaseDemo  src:" + src)
+        data ={}
+        data["hits"] = 10
+        data["src"] = src
+        result = get_simi_docs(data["src"], data["hits"], anyou_type)
+        output = {}
+        output["源案例"] = src
+        output["相似案例"] =result
+        stopword_set=set(["年", "月", "日",  "的", "了", "将", "诉称"
+                      , "后", "于", "并", "但",  "与",   "元", "万元"
+                      , "”", "、","《", "》",  "：", "；","，",  "。"])
+        #src=src.decode('utf-8')
+        src_word_list = jieba.cut(src, cut_all=False)
+        src_word_set = set()
+        digits = re.compile(r"\d+")
+        for word in src_word_list:
+            digitmatch = re.match(digits, word)
+            if digitmatch != None:
+                continue
+            if word.encode() not in stopword_set:
+                src_word_set.add(word)
+        i = 1
+        docs = []
+        for res in result:
+            target_word_list = jieba.cut(res["src"], cut_all=False)
+            doc ={}
+            doc["id"] = i
+            doc["content"] = ""
+            sameCount = 0
+            sameWords = ""
+            for word in target_word_list:
+                if word in src_word_set:
+                    sameWords += word
+                    sameCount += 1
+                else:
+                    if sameCount >= 3:
+                        doc["content"] += "<b><font color=\"red\">" + sameWords + "</font></b>"
+                    else:
+                        doc["content"] += sameWords
+                    sameCount = 0
+                    sameWords = ""
+                    doc["content"] += word
+                    sameFound = 1
+            if sameCount > 0:
+                if sameCount >= 2:
+                    doc["content"] += "<b><font color=\"red\">" + sameWords + "</font></b>"
+                else:
+                    doc["content"] += sameWords
+            i += 1
+            docs.append(doc)
+
+        elapse_time = time.time() - start_time
+        output = {}
+        output["status"] = 'ok'
+        output["docs"] = docs
+        output["耗时"] = elapse_time
+        self.set_header("Access-Control-Allow-Origin", "*")
+        self.write(json.dumps(output))
+
+settings = {
+    'static_path': os.path.join(os.path.dirname(__file__), 'anyou'),
+    'cookie_secret': '61oETzKXQAGaYdkL5gEmGeJJFuYh7EQnp2XdTP1o/Vo=',
+    'login_url': '/login',
+    'xsrf_cookies': False,
+}
+
+application = tornado.web.Application([
+    (r'/', MainHandler),
+    (r'/similarCaseDemo', SimilarCaseDemoHandler),
+    (r'/similarCase', SimilarCaseHandler),
+    (r'/anyou/(xingshi_classify\.json)', tornado.web.StaticFileHandler, dict(path=settings['static_path'])),
+    (r'/anyou/(minshi_classify\.json)', tornado.web.StaticFileHandler, dict(path=settings['static_path'])),
+], **settings)
+
+if __name__ == '__main__':
+    cp = ConfigParser.SafeConfigParser()
+    cp.read('calc_simi_anyou.conf')
+    work_dir = cp.get('server', 'work_dir')
+    server_port = cp.get('server', 'port')
+
+    mp_server_ip_str = cp.get('java_mp', 'server_url')
+    mp_server_url = [s.strip() + 'mpJavaSimilarAnyou' for s in mp_server_ip_str[1:-1].split(',')]
+    class_server_url = cp.get('class_server', 'server_url')
+
+    node.loadConfig(work_dir + 'anyou/AY_minshi.xml', minshi_firstlist, minshi_nodemap, minshi_label_map)
+    node.loadConfig(work_dir + 'anyou/AY_xingshi.xml', xingshi_firstlist, xingshi_nodemap, xingshi_label_map)
+
+    similog = FinalLogger.getLogger()
+    similog.info('anyou classify')
+
+    print '---start server---'
+    similog.info('---start server---')
+
+    application.listen(server_port)
+    tornado.ioloop.IOLoop.instance().start()
